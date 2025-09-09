@@ -385,7 +385,7 @@ pub mod vault_with_treasury {
         Ok(())
     }
 
-    /// Batch collect fees for multiple users  
+    /// Batch collect fees for multiple users
     pub fn collect_batch_fees<'info>(ctx: Context<'_, '_, 'info, 'info, CollectBatchFees<'info>>) -> Result<()> {
         let config = &mut ctx.accounts.protocol_config;
         require!(
