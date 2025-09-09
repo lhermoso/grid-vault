@@ -97,16 +97,15 @@ pub mod vault_with_treasury {
         let user_value_pool = total_value.checked_sub(config.accumulated_fees).ok_or(VaultError::MathOverflow)?;
 
         // Calculate shares to mint
-        let shares_to_mint: u64;
-        if config.total_shares == 0 {
-            shares_to_mint = amount;
+        let shares_to_mint: u64 = if config.total_shares == 0 {
+            amount
         } else {
-            shares_to_mint = ((amount as u128)
+            ((amount as u128)
                 .checked_mul(config.total_shares as u128)
                 .ok_or(VaultError::MathOverflow)?
                 .checked_div(user_value_pool as u128)
-                .ok_or(VaultError::MathOverflow)?) as u64;
-        }
+                .ok_or(VaultError::MathOverflow)?) as u64
+        };
         require!(shares_to_mint >= min_shares, VaultError::SlippageExceeded);
 
         // Update user position
@@ -148,7 +147,7 @@ pub mod vault_with_treasury {
         let position = ctx.accounts.user_position.load()?;
         let (user_balance, user_value_pool, _total_value) = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            &*position,
+            &position,
             ctx.accounts.treasury_account.amount,
         )?;
         drop(position); // Release the immutable borrow
@@ -345,7 +344,7 @@ pub mod vault_with_treasury {
             );
             let (cb, uvp, _) = calculate_user_balance_internal(
                 cfg_ref,
-                &*position,
+                &position,
                 ctx.accounts.treasury_account.amount,
             )?;
             (cb, uvp, position.high_water_mark, cfg_ref.performance_fee_bps)
@@ -353,7 +352,7 @@ pub mod vault_with_treasury {
 
         // Now use mutable borrow for mutations
         let mut position = ctx.accounts.user_position.load_mut()?;
-        let profit = current_balance.checked_sub(high_water_mark).unwrap_or(0);
+        let profit = current_balance.saturating_sub(high_water_mark);
 
         // Compute fee from the copied perf_bps to avoid holding cfg_ref
         let fee = ((profit as u128)
@@ -430,14 +429,14 @@ pub mod vault_with_treasury {
                 let cfg_ref = &ctx.accounts.protocol_config;
                 let (cb, uvp, _) = calculate_user_balance_internal(
                     cfg_ref,
-                    &*position,
+                    &position,
                     treasury_balance,
                 )?;
                 (cb, uvp, position.high_water_mark, position.owner, cfg_ref.performance_fee_bps)
             }; // immutable borrows end here
             
             // Now use mutable borrow for mutations
-            let profit = current_balance.checked_sub(high_water_mark).unwrap_or(0);
+            let profit = current_balance.saturating_sub(high_water_mark);
             // Compute fee from the copied perf_bps to avoid holding cfg_ref while mut-borrowing
             let fee = ((profit as u128)
                 .checked_mul(perf_bps as u128)
@@ -527,7 +526,7 @@ pub mod vault_with_treasury {
         let position = ctx.accounts.user_position.load()?;
         let (user_balance, _, _) = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            &*position,
+            &position,
             ctx.accounts.treasury_account.amount,
         )?;
         Ok(user_balance)
@@ -546,7 +545,7 @@ pub mod vault_with_treasury {
         let position = ctx.accounts.user_position.load()?;
         let balance = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            &*position,
+            &position,
             ctx.accounts.treasury_account.amount,
         )?.0;
         Ok((balance, position.lifetime_fees_paid, position.last_fee_collection))
