@@ -434,7 +434,7 @@ pub mod vault_with_treasury {
                 )?;
                 (cb, uvp, position.high_water_mark, position.owner, cfg_ref.performance_fee_bps)
             }; // immutable borrows end here
-            
+
             // Now use mutable borrow for mutations
             let profit = current_balance.saturating_sub(high_water_mark);
             // Compute fee from the copied perf_bps to avoid holding cfg_ref while mut-borrowing
@@ -445,7 +445,7 @@ pub mod vault_with_treasury {
                 .ok_or(VaultError::MathOverflow)?) as u64;
 
             let mut position = loader.load_mut()?; // mutable borrow
-            
+
             if fee > 0 {
                 // Borrow ProtocolConfig mutably only now (for current total_shares and to write)
                 let config = &mut ctx.accounts.protocol_config;
