@@ -8,6 +8,18 @@ declare_id!("521NYDkSEV1htFy6iAkwCfkZrAvaaw7YYDd4dhtfnXQ7");
 const PERFORMANCE_FEE_BPS: u16 = 2500; // 25%
 const FEE_COLLECTION_INTERVAL: i64 = 30 * 24 * 60 * 60; // 30 days in seconds
 const TRADING_ALLOCATION_BPS: u16 = 9000; // 90% can be used for trading
+const STALE_VALUATION_THRESHOLD: i64 = 24 * 60 * 60; // 24 hours in seconds
+
+/// Deployment valuation data from the trading bot
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct DeploymentValuation {
+    pub deployment_id: u64,
+    pub orca_positions_value: u64,
+    pub drift_equity_value: u64,
+    pub uncollected_fees: u64,
+    pub unrealized_pnl: i64,
+    pub timestamp: i64,
+}
 
 /// Helper to calculate user balance (internal)
 fn calculate_user_balance_internal(
@@ -15,9 +27,34 @@ fn calculate_user_balance_internal(
     position: &UserPosition,
     treasury_balance: u64,
 ) -> Result<(u64, u64, u64)> {
-    let deployed_capital = config.total_trading_deployed;
-    let total_value = treasury_balance.checked_add(deployed_capital).ok_or(VaultError::MathOverflow)?;
-    let user_value_pool = total_value.checked_sub(config.accumulated_fees).ok_or(VaultError::MathOverflow)?;
+    // Use current valuation if available and fresh, otherwise fall back to original deployed amount
+    let deployed_value = if config.last_valuation_timestamp > 0 {
+        let now = Clock::get().unwrap_or(Clock {
+            slot: 0,
+            epoch_start_timestamp: 0,
+            epoch: 0,
+            leader_schedule_epoch: 0,
+            unix_timestamp: 0,
+        }).unix_timestamp;
+        
+        // Check if valuation is fresh (within 24 hours)
+        if now - config.last_valuation_timestamp <= STALE_VALUATION_THRESHOLD {
+            config.deployed_current_value
+        } else {
+            // Valuation is stale, use original amount
+            config.total_trading_deployed
+        }
+    } else {
+        // No valuation yet, use original amount
+        config.total_trading_deployed
+    };
+    
+    let total_value = treasury_balance.checked_add(deployed_value).ok_or(VaultError::MathOverflow)?;
+    // Subtract both realized and unrealized fees from user value pool
+    let total_fees = config.accumulated_fees
+        .checked_add(config.pending_unrealized_fees)
+        .ok_or(VaultError::MathOverflow)?;
+    let user_value_pool = total_value.checked_sub(total_fees).ok_or(VaultError::MathOverflow)?;
 
     if config.total_shares == 0 {
         return Ok((0, user_value_pool, total_value));
@@ -53,6 +90,9 @@ pub mod vault_with_treasury {
         config.is_paused = false;
         config.bump = ctx.bumps.protocol_config;
         config.last_fee_sweep = 0;
+        config.deployed_current_value = 0;
+        config.last_valuation_timestamp = 0;
+        config.pending_unrealized_fees = 0;
 
         msg!("Protocol initialized with treasury: {}", config.treasury);
         Ok(())
@@ -296,6 +336,28 @@ pub mod vault_with_treasury {
         config.total_trading_deployed = config.total_trading_deployed
             .checked_sub(original_deployed)
             .ok_or(VaultError::MathOverflow)?;
+        
+        // Clear valuation data if all capital is returned
+        if config.total_trading_deployed == 0 {
+            config.deployed_current_value = 0;
+            config.last_valuation_timestamp = 0;
+            config.pending_unrealized_fees = 0;
+        } else {
+            // Proportionally reduce deployed current value
+            if config.deployed_current_value > 0 && config.total_trading_deployed > 0 {
+                let remaining_ratio = ((config.total_trading_deployed as u128)
+                    .checked_mul(10000)
+                    .ok_or(VaultError::MathOverflow)?
+                    .checked_div((config.total_trading_deployed + original_deployed) as u128)
+                    .ok_or(VaultError::MathOverflow)?) as u64;
+                
+                config.deployed_current_value = ((config.deployed_current_value as u128)
+                    .checked_mul(remaining_ratio as u128)
+                    .ok_or(VaultError::MathOverflow)?
+                    .checked_div(10000)
+                    .ok_or(VaultError::MathOverflow)?) as u64;
+            }
+        }
 
         if profit_or_loss > 0 {
             let profit = profit_or_loss as u64;
@@ -308,6 +370,11 @@ pub mod vault_with_treasury {
             config.accumulated_fees = config.accumulated_fees
                 .checked_add(fee)
                 .ok_or(VaultError::MathOverflow)?;
+            
+            // Reduce pending unrealized fees by the realized portion
+            if config.pending_unrealized_fees > 0 {
+                config.pending_unrealized_fees = config.pending_unrealized_fees.saturating_sub(fee);
+            }
 
             msg!("Partial profit: {}, Fee accrued: {}", profit, fee);
         } else if profit_or_loss < 0 {
@@ -479,6 +546,72 @@ pub mod vault_with_treasury {
         }
 
         msg!("Batch collected total fees: {}", total_fees);
+        Ok(())
+    }
+
+    /// Trading bot updates the current valuation of deployed capital
+    pub fn update_deployment_valuation(
+        ctx: Context<UpdateValuation>,
+        valuation: DeploymentValuation,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.protocol_config;
+        
+        // Verify caller is the authorized trading bot
+        require!(
+            ctx.accounts.trading_bot.key() == config.trading_bot,
+            VaultError::UnauthorizedTradingBot
+        );
+        
+        // Verify timestamp is recent
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            valuation.timestamp <= now && valuation.timestamp >= now - 300, // Within 5 minutes
+            VaultError::InvalidValuation
+        );
+        
+        // Calculate total current value
+        let total_current_value = valuation.orca_positions_value
+            .checked_add(valuation.drift_equity_value)
+            .ok_or(VaultError::MathOverflow)?
+            .checked_add(valuation.uncollected_fees)
+            .ok_or(VaultError::MathOverflow)?;
+        
+        // Update deployed current value
+        config.deployed_current_value = total_current_value;
+        config.last_valuation_timestamp = valuation.timestamp;
+        
+        // Calculate and update pending unrealized fees if there's profit
+        if valuation.unrealized_pnl > 0 {
+            let unrealized_profit = valuation.unrealized_pnl as u64;
+            let pending_fee = ((unrealized_profit as u128)
+                .checked_mul(config.performance_fee_bps as u128)
+                .ok_or(VaultError::MathOverflow)?
+                .checked_div(10000)
+                .ok_or(VaultError::MathOverflow)?) as u64;
+            
+            config.pending_unrealized_fees = pending_fee;
+        } else {
+            // No fees on losses
+            config.pending_unrealized_fees = 0;
+        }
+        
+        emit!(ValuationUpdateEvent {
+            total_deployed_original: config.total_trading_deployed,
+            total_deployed_current: total_current_value,
+            orca_value: valuation.orca_positions_value,
+            drift_value: valuation.drift_equity_value,
+            uncollected_fees: valuation.uncollected_fees,
+            unrealized_pnl: valuation.unrealized_pnl,
+            pending_fees: config.pending_unrealized_fees,
+            timestamp: valuation.timestamp,
+        });
+        
+        msg!("Updated deployed capital valuation: Original: {}, Current: {}, PnL: {}", 
+            config.total_trading_deployed, 
+            total_current_value, 
+            valuation.unrealized_pnl
+        );
+        
         Ok(())
     }
 
@@ -756,6 +889,17 @@ pub struct CollectBatchFees<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateValuation<'info> {
+    pub trading_bot: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"protocol_config"],
+        bump = protocol_config.bump
+    )]
+    pub protocol_config: Account<'info, ProtocolConfig>,
+}
+
+#[derive(Accounts)]
 pub struct CollectFees<'info> {
     pub admin: Signer<'info>,
     #[account(mut)]
@@ -834,10 +978,13 @@ pub struct ProtocolConfig {
     pub is_paused: bool,
     pub bump: u8,
     pub last_fee_sweep: i64,
+    pub deployed_current_value: u64,      // Current market value of deployed capital
+    pub last_valuation_timestamp: i64,    // When valuation was last updated
+    pub pending_unrealized_fees: u64,     // Performance fees on unrealized gains
 }
 
 impl ProtocolConfig {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 2 + 1 + 1 + 8 + 32; // Disc + fields + padding
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 2 + 1 + 1 + 8 + 8 + 8 + 8 + 32; // Disc + fields + padding
 }
 
 #[account(zero_copy)]
@@ -908,6 +1055,18 @@ pub struct FeesWithdrawnEvent {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct ValuationUpdateEvent {
+    pub total_deployed_original: u64,
+    pub total_deployed_current: u64,
+    pub orca_value: u64,
+    pub drift_value: u64,
+    pub uncollected_fees: u64,
+    pub unrealized_pnl: i64,
+    pub pending_fees: u64,
+    pub timestamp: i64,
+}
+
 // ============ ERRORS ============
 
 #[error_code]
@@ -940,4 +1099,8 @@ pub enum VaultError {
     InvalidAccounts,
     #[msg("Slippage exceeded")]
     SlippageExceeded,
+    #[msg("Valuation data is stale")]
+    StaleValuation,
+    #[msg("Invalid valuation data")]
+    InvalidValuation,
 }
