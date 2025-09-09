@@ -192,8 +192,8 @@ grid-vault/
 
 ## 📈 Roadmap
 
-- [ ] Multi-asset support (USDC, USDT)
-- [ ] Advanced grid strategies
+- [x] Multi-asset support (USDC, USDT)
+- [x] Advanced grid strategies
 - [ ] Governance token integration
 - [ ] Cross-chain bridging
 - [ ] Mobile SDK
@@ -225,6 +225,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Built with ⚡ on Solana**
 
-[Website](https://gridvault.io) • [Documentation](https://docs.gridvault.io) • [Twitter](https://twitter.com/gridvault) • [Discord](https://discord.gg/gridvault)
+[Website](https://usegrid.xyz/) • [Documentation](https://docs.usegrid.xyz) • [X](https://x.com/leohermoso) • [Discord](https://discord.gg/usegrid)
 
 </div>
