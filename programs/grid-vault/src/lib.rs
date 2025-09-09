@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::accounts::account_loader::AccountLoader;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
 
 declare_id!("521NYDkSEV1htFy6iAkwCfkZrAvaaw7YYDd4dhtfnXQ7");
@@ -22,7 +23,11 @@ fn calculate_user_balance_internal(
         return Ok((0, user_value_pool, total_value));
     }
 
-    let user_balance = (position.user_shares as u128 * user_value_pool as u128 / config.total_shares as u128) as u64;
+    let user_balance = ((position.user_shares as u128)
+        .checked_mul(user_value_pool as u128)
+        .ok_or(VaultError::MathOverflow)?
+        .checked_div(config.total_shares as u128)
+        .ok_or(VaultError::MathOverflow)?) as u64;
 
     Ok((user_balance, user_value_pool, total_value))
 }
@@ -55,14 +60,15 @@ pub mod vault_with_treasury {
 
     /// User creates their position in the vault
     pub fn create_user_position(ctx: Context<CreateUserPosition>) -> Result<()> {
-        let position = &mut ctx.accounts.user_position;
+        let position = &mut ctx.accounts.user_position.load_init()?;
         position.owner = ctx.accounts.owner.key();
         position.deposited_amount = 0;
         position.user_shares = 0;
         position.high_water_mark = 0;
         position.last_fee_collection = Clock::get()?.unix_timestamp;
         position.lifetime_fees_paid = 0;
-        position.is_active = true;
+        position.is_active = 1; // true
+        position._padding = [0; 7];
 
         msg!("User position created for: {}", position.owner);
         Ok(())
@@ -104,7 +110,7 @@ pub mod vault_with_treasury {
         require!(shares_to_mint >= min_shares, VaultError::SlippageExceeded);
 
         // Update user position
-        let position = &mut ctx.accounts.user_position;
+        let mut position = ctx.accounts.user_position.load_mut()?;
         position.deposited_amount = position.deposited_amount
             .checked_add(amount)
             .ok_or(VaultError::MathOverflow)?;
@@ -139,11 +145,13 @@ pub mod vault_with_treasury {
         require!(!ctx.accounts.protocol_config.is_paused, VaultError::ProtocolPaused);
 
         // Calculate current user balance
+        let position = ctx.accounts.user_position.load()?;
         let (user_balance, user_value_pool, _total_value) = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            &ctx.accounts.user_position,
+            &*position,
             ctx.accounts.treasury_account.amount,
         )?;
+        drop(position); // Release the immutable borrow
         require!(user_balance >= amount, VaultError::InsufficientBalance);
 
         // Check liquidity
@@ -160,7 +168,7 @@ pub mod vault_with_treasury {
         require!(shares_to_burn <= max_shares, VaultError::SlippageExceeded);
 
         // Update user position
-        let position = &mut ctx.accounts.user_position;
+        let mut position = ctx.accounts.user_position.load_mut()?;
         let original_shares = position.user_shares;
         position.user_shares = position.user_shares
             .checked_sub(shares_to_burn)
@@ -227,10 +235,9 @@ pub mod vault_with_treasury {
 
         require!(amount <= max_deployable, VaultError::ExceedsMaxDeployment);
 
-        let bump = config.bump;
         let config_seeds: &[&[&[u8]]] = &[&[
             b"protocol_config",
-            &[bump],
+            &[config.bump],
         ]];
 
         let cpi_accounts = Transfer {
@@ -321,35 +328,43 @@ pub mod vault_with_treasury {
 
     /// Collect monthly performance fees for a single user
     pub fn collect_user_fees(ctx: Context<CollectUserFees>) -> Result<()> {
-        let config = &mut ctx.accounts.protocol_config;
+        // Read-only first
+        let cfg_ref = &ctx.accounts.protocol_config;
         require!(
-            ctx.accounts.caller.key() == config.admin || ctx.accounts.caller.key() == config.trading_bot,
+            ctx.accounts.caller.key() == cfg_ref.admin || ctx.accounts.caller.key() == cfg_ref.trading_bot,
             VaultError::UnauthorizedCaller
         );
 
         let now = Clock::get()?.unix_timestamp;
-        let position = &mut ctx.accounts.user_position;
-        require!(now >= position.last_fee_collection + FEE_COLLECTION_INTERVAL, VaultError::FeeCollectionTooSoon);
+        // First, use immutable borrow for checks and calculations
+        let (current_balance, user_value_pool, high_water_mark, perf_bps) = {
+            let position = ctx.accounts.user_position.load()?; // immutable borrow
+            require!(
+                now >= position.last_fee_collection + FEE_COLLECTION_INTERVAL,
+                VaultError::FeeCollectionTooSoon
+            );
+            let (cb, uvp, _) = calculate_user_balance_internal(
+                cfg_ref,
+                &*position,
+                ctx.accounts.treasury_account.amount,
+            )?;
+            (cb, uvp, position.high_water_mark, cfg_ref.performance_fee_bps)
+        }; // immutable borrows end here
 
-        let (current_balance, user_value_pool, _) = calculate_user_balance_internal(
-            &config,
-            &position,
-            ctx.accounts.treasury_account.amount,
-        )?;
+        // Now use mutable borrow for mutations
+        let mut position = ctx.accounts.user_position.load_mut()?;
+        let profit = current_balance.checked_sub(high_water_mark).unwrap_or(0);
 
-        let profit = if current_balance > position.high_water_mark {
-            current_balance - position.high_water_mark
-        } else {
-            0
-        };
-
+        // Compute fee from the copied perf_bps to avoid holding cfg_ref
         let fee = ((profit as u128)
-            .checked_mul(config.performance_fee_bps as u128)
+            .checked_mul(perf_bps as u128)
             .ok_or(VaultError::MathOverflow)?
             .checked_div(10000)
             .ok_or(VaultError::MathOverflow)?) as u64;
 
         if fee > 0 {
+            // Borrow ProtocolConfig mutably only when needed for writes and reading total_shares
+            let config = &mut ctx.accounts.protocol_config;
             let shares_to_reduce = ((fee as u128)
                 .checked_mul(config.total_shares as u128)
                 .ok_or(VaultError::MathOverflow)?
@@ -387,50 +402,73 @@ pub mod vault_with_treasury {
 
     /// Batch collect fees for multiple users
     pub fn collect_batch_fees<'info>(ctx: Context<'_, '_, 'info, 'info, CollectBatchFees<'info>>) -> Result<()> {
-        let config = &mut ctx.accounts.protocol_config;
-        require!(
-            ctx.accounts.caller.key() == config.admin || ctx.accounts.caller.key() == config.trading_bot,
-            VaultError::UnauthorizedCaller
-        );
+        // Read-only first to check authorization
+        {
+            let cfg_ref = &ctx.accounts.protocol_config;
+            require!(
+                ctx.accounts.caller.key() == cfg_ref.admin || ctx.accounts.caller.key() == cfg_ref.trading_bot,
+                VaultError::UnauthorizedCaller
+            );
+        }
 
         let now = Clock::get()?.unix_timestamp;
         let treasury_balance = ctx.accounts.treasury_account.amount;
         let mut total_fees = 0u64;
         let mut _total_shares_reduced = 0u64;
 
-        for account_info in ctx.remaining_accounts.iter() {
-            let mut position = Account::<UserPosition>::try_from(account_info)?;
+        // Process each account separately to avoid lifetime issues
+        let num_accounts = ctx.remaining_accounts.len();
+        for i in 0..num_accounts {
+            let account_info = &ctx.remaining_accounts[i];
+            let loader: AccountLoader<UserPosition> = AccountLoader::try_from(account_info)?;
+            // First, check eligibility and calculate with immutable borrow
+            let (current_balance, user_value_pool, high_water_mark, owner, perf_bps) = {
+                let position = loader.load()?; // immutable borrow
+                if now < position.last_fee_collection + FEE_COLLECTION_INTERVAL {
+                    continue;
+                }
+                let cfg_ref = &ctx.accounts.protocol_config;
+                let (cb, uvp, _) = calculate_user_balance_internal(
+                    cfg_ref,
+                    &*position,
+                    treasury_balance,
+                )?;
+                (cb, uvp, position.high_water_mark, position.owner, cfg_ref.performance_fee_bps)
+            }; // immutable borrows end here
+            
+            // Now use mutable borrow for mutations
+            let profit = current_balance.checked_sub(high_water_mark).unwrap_or(0);
+            // Compute fee from the copied perf_bps to avoid holding cfg_ref while mut-borrowing
+            let fee = ((profit as u128)
+                .checked_mul(perf_bps as u128)
+                .ok_or(VaultError::MathOverflow)?
+                .checked_div(10000)
+                .ok_or(VaultError::MathOverflow)?) as u64;
 
-            if now < position.last_fee_collection + FEE_COLLECTION_INTERVAL {
-                continue;
-            }
-
-            let tmp = calculate_user_balance_internal(
-                &*config,
-                &position,
-                treasury_balance,
-            )?;
-            let (current_balance, user_value_pool, _) = tmp;
-
-            let profit = current_balance.saturating_sub(position.high_water_mark);
-            let fee = (profit as u128 * config.performance_fee_bps as u128 / 10000) as u64;
-
+            let mut position = loader.load_mut()?; // mutable borrow
+            
             if fee > 0 {
-                let shares_to_reduce = (fee as u128 * config.total_shares as u128 / user_value_pool as u128) as u64;
+                // Borrow ProtocolConfig mutably only now (for current total_shares and to write)
+                let config = &mut ctx.accounts.protocol_config;
+                let shares_to_reduce = ((fee as u128)
+                    .checked_mul(config.total_shares as u128)
+                    .ok_or(VaultError::MathOverflow)?
+                    .checked_div(user_value_pool as u128)
+                    .ok_or(VaultError::MathOverflow)?) as u64;
 
-                position.user_shares -= shares_to_reduce;
+                position.user_shares = position.user_shares.checked_sub(shares_to_reduce).ok_or(VaultError::MathOverflow)?;
                 position.high_water_mark = current_balance - fee;
-                position.lifetime_fees_paid += fee;
+                position.lifetime_fees_paid = position.lifetime_fees_paid.checked_add(fee).ok_or(VaultError::MathOverflow)?;
                 position.last_fee_collection = now;
 
-                config.total_shares -= shares_to_reduce;
-                config.accumulated_fees += fee;
+                config.total_shares = config.total_shares.checked_sub(shares_to_reduce).ok_or(VaultError::MathOverflow)?;
+                config.accumulated_fees = config.accumulated_fees.checked_add(fee).ok_or(VaultError::MathOverflow)?;
 
                 total_fees += fee;
                 _total_shares_reduced += shares_to_reduce;
 
                 emit!(FeeCollectedEvent {
-                    user: position.owner,
+                    user: owner,
                     fee,
                     shares_reduced: shares_to_reduce,
                     timestamp: now,
@@ -438,8 +476,7 @@ pub mod vault_with_treasury {
             } else {
                 position.last_fee_collection = now;
             }
-
-            // Anchor automatically handles serialization on exit
+            // Loader auto-stores on drop
         }
 
         msg!("Batch collected total fees: {}", total_fees);
@@ -457,11 +494,11 @@ pub mod vault_with_treasury {
         let fees = config.accumulated_fees;
         require!(fees > 0, VaultError::NoFeesToCollect);
 
-        let bump = config.bump;
-        let config_seeds: &[&[&[u8]]] = &[&[
-            b"protocol_config",
-            &[bump],
-        ]];
+                 let config_seeds: &[&[&[u8]]] = &[&[
+                     b"protocol_config",
+                   &[config.bump],
+                 ]];
+
 
         let cpi_accounts = Transfer {
             from: ctx.accounts.treasury_account.to_account_info(),
@@ -487,9 +524,10 @@ pub mod vault_with_treasury {
 
     /// View function for user balance
     pub fn calculate_user_balance(ctx: Context<CalculateBalance>) -> Result<u64> {
+        let position = ctx.accounts.user_position.load()?;
         let (user_balance, _, _) = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            &ctx.accounts.user_position,
+            &*position,
             ctx.accounts.treasury_account.amount,
         )?;
         Ok(user_balance)
@@ -505,10 +543,10 @@ pub mod vault_with_treasury {
 
     /// View: User stats
     pub fn get_user_stats(ctx: Context<GetUserStats>) -> Result<(u64, u64, i64)> {
-        let position = &ctx.accounts.user_position;
+        let position = ctx.accounts.user_position.load()?;
         let balance = calculate_user_balance_internal(
             &ctx.accounts.protocol_config,
-            position,
+            &*position,
             ctx.accounts.treasury_account.amount,
         )?.0;
         Ok((balance, position.lifetime_fees_paid, position.last_fee_collection))
@@ -517,7 +555,7 @@ pub mod vault_with_treasury {
     /// View: Check fee eligibility
     pub fn check_fee_eligibility(ctx: Context<CheckFeeEligibility>) -> Result<bool> {
         let now = Clock::get()?.unix_timestamp;
-        let position = &ctx.accounts.user_position;
+        let position = ctx.accounts.user_position.load()?;
         Ok(now >= position.last_fee_collection + FEE_COLLECTION_INTERVAL)
     }
 
@@ -578,7 +616,7 @@ pub struct CreateUserPosition<'info> {
         seeds = [b"user_position", owner.key().as_ref()],
         bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     pub system_program: Program<'info, System>,
 }
 
@@ -589,10 +627,9 @@ pub struct Deposit<'info> {
     #[account(
         mut,
         seeds = [b"user_position", owner.key().as_ref()],
-        bump,
-        constraint = user_position.owner == owner.key()
+        bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     #[account(
         mut,
         seeds = [b"protocol_config"],
@@ -617,10 +654,9 @@ pub struct Withdraw<'info> {
     #[account(
         mut,
         seeds = [b"user_position", owner.key().as_ref()],
-        bump,
-        constraint = user_position.owner == owner.key()
+        bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     #[account(
         mut,
         seeds = [b"protocol_config"],
@@ -684,7 +720,7 @@ pub struct CalculateBalance<'info> {
         seeds = [b"user_position", owner.key().as_ref()],
         bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     /// CHECK: Owner pubkey for deriving PDA
     pub owner: UncheckedAccount<'info>,
     #[account(
@@ -705,7 +741,7 @@ pub struct CollectUserFees<'info> {
     #[account(mut)]
     pub protocol_config: Account<'info, ProtocolConfig>,
     #[account(mut)]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     #[account(mut)]
     pub treasury_account: Account<'info, TokenAccount>,
 }
@@ -752,7 +788,7 @@ pub struct GetUserStats<'info> {
         seeds = [b"user_position", owner.key().as_ref()],
         bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     /// CHECK: Owner pubkey
     pub owner: UncheckedAccount<'info>,
     #[account(
@@ -773,7 +809,7 @@ pub struct CheckFeeEligibility<'info> {
         seeds = [b"user_position", owner.key().as_ref()],
         bump
     )]
-    pub user_position: Account<'info, UserPosition>,
+    pub user_position: AccountLoader<'info, UserPosition>,
     /// CHECK: Owner pubkey
     pub owner: UncheckedAccount<'info>,
 }
@@ -805,7 +841,9 @@ impl ProtocolConfig {
     pub const LEN: usize = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 2 + 1 + 1 + 8 + 32; // Disc + fields + padding
 }
 
-#[account]
+#[account(zero_copy)]
+#[repr(C)]
+#[derive(Debug)]
 pub struct UserPosition {
     pub owner: Pubkey,
     pub deposited_amount: u64,
@@ -813,11 +851,12 @@ pub struct UserPosition {
     pub high_water_mark: u64,
     pub last_fee_collection: i64,
     pub lifetime_fees_paid: u64,
-    pub is_active: bool,
+    pub is_active: u8, // 0 = false, 1 = true for zero-copy compatibility
+    pub _padding: [u8; 7], // Padding for alignment
 }
 
 impl UserPosition {
-    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 32; // Disc + fields + padding
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 7; // Disc + fields + 7 bytes padding for alignment
 }
 
 // ============ EVENTS ============
